@@ -15,7 +15,7 @@
 
 // 操作码枚举
 enum Opcode {
-    DOT8
+    MPDPA
 };
 
 // 舍入模式枚举
@@ -39,7 +39,7 @@ struct Result {
 
 // 字符串到操作码映射
 std::map<std::string, Opcode> opcodeMap = {
-    {"DOT8", DOT8}
+    {"MPDPA", MPDPA}
 };
 
 // 字符串到舍入模式映射
