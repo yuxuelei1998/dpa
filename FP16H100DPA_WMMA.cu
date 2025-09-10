@@ -27,14 +27,11 @@ __global__ void dpas_kernel(const half* A, const half* B, const float* C, float*
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
 
-    // 初始化累加器为C的值
     wmma::fill_fragment(acc_frag, 0.0f);
-    if (threadIdx.x == 0) {
-        acc_frag.x[0] = myC;
-    }
 
     __shared__ half smem_A[16*16];
     __shared__ half smem_B[16*16];
+    __shared__ float result_smem[16*16];
 
     // 初始化共享内存为0
     for (int i = threadIdx.x; i < 16*16; i += blockDim.x) {
@@ -56,18 +53,30 @@ __global__ void dpas_kernel(const half* A, const half* B, const float* C, float*
     wmma::load_matrix_sync(a_frag, smem_A, 16);
     wmma::load_matrix_sync(b_frag, smem_B, 16);
 
-    // 执行矩阵乘加 (A*B + C)
+    // 执行矩阵乘加
     wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
 
     // 存储结果到共享内存
-    __shared__ float result_smem[16*16];
     wmma::store_matrix_sync(result_smem, acc_frag, 16, wmma::mem_row_major);
     __syncthreads();
 
     float dot_product = result_smem[0];  // 获取点积结果
 
+    // 根据舍入模式计算最终结果
+    float final_result;
+    switch (my_round_mode) {
+        case 0:  // RND_NEAREST
+            final_result = __fadd_rn(dot_product, myC);
+            break;
+        case 1:  // RND_ZERO
+            final_result = __fadd_rz(dot_product, myC);
+            break;
+        default:
+            final_result = __fadd_rn(dot_product, myC);
+    }
+
     if (threadIdx.x == 0) {
-        D[line_id] = dot_product;
+        D[line_id] = final_result;
     }
 }
 
@@ -102,10 +111,8 @@ std::string float2hex(float f) {
 
 int main() {
     std::map<std::string, int> roundModeMap = {
-        {"RND_NEAREST", 0},
         {"RND_ZERO", 1},
-        {"RND_FINITE", 2},
-        {"RND_INF", 3}
+        {"RND_NEAREST", 0}
     };
     
     std::string input_filename, output_filename;
@@ -137,7 +144,7 @@ int main() {
 
     std::ifstream infile(input_filename);
     if (!infile.is_open()) {
-        std::cerr << "打开文件失败" << std::endl;
+        std::cerr << "Failed to open input file." << std::endl;
         return 1;
     }
 
@@ -152,6 +159,7 @@ int main() {
         std::string token;
         std::vector<std::string> tokens;
         while (std::getline(iss, token, ',')) {
+            // 去除 token 前后的空格
             token.erase(0, token.find_first_not_of(" "));
             token.erase(token.find_last_not_of(" ") + 1);
             tokens.push_back(token);
@@ -166,7 +174,7 @@ int main() {
         if (roundModeMap.find(tokens[1]) != roundModeMap.end()) {
             round_mode = roundModeMap[tokens[1]];
         } else {
-            std::cerr << "未知舍入模式：" << tokens[1] << ", 使用默认舍入模式：RND_NEAREST " << std::endl;
+            std::cerr << "Unknown rounding mode: " << tokens[1] << ", using RND_NEAREST as default." << std::endl;
             round_mode = 0;
         }
         round_modes.push_back(round_mode);
@@ -195,7 +203,7 @@ int main() {
     int num_lines = round_modes.size();
 
     if (num_lines == 0) {
-        std::cerr << "错误：无有效测试用例，程序终止\n";
+        std::cerr << "错误：无有效测试用例，程序终止。\n";
         return 1;
     }
 
@@ -254,7 +262,7 @@ int main() {
     std::ifstream infile2(input_filename);
     std::ofstream outfile(output_filename);
     if (!infile2.is_open() || !outfile.is_open()) {
-        std::cerr << "写入结果失败" << std::endl;
+        std::cerr << "Failed to open files for writing." << std::endl;
         return 1;
     }
 
@@ -272,6 +280,6 @@ int main() {
     infile2.close();
     outfile.close();
 
-    std::cout << "八点积加操作完成，写入文件：" << output_filename << std::endl;
+    std::cout << "Processing completed. Output written to " << output_filename << std::endl;
     return 0;
 }

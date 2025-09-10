@@ -170,7 +170,7 @@ int main() {
             continue;
         }
         
-        if (op != "DOT8") {
+        if (op != "MPDPA") {
             std::cerr << "第 " << lineNum << " 行不支持的操作: " << op << std::endl;
             continue;
         }

@@ -140,7 +140,7 @@ void executeDot8WithCublas(const TestCase* testCases, Result* results, int numTe
             CUDA_R_32F,   // C矩阵数据类型
             1,            // C矩阵的leading dimension
             CUDA_R_32F,   // 计算类型
-            CUBLAS_GEMM_DEFAULT  // 算法
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP  // 算法
         ));
     }
     
