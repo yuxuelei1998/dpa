@@ -6,14 +6,15 @@
 #include <iomanip>
 #include <cstring>
 #include <map>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 
 using namespace nvcuda;
 
-// 内核函数：使用Tensor Core计算点积加
-__global__ void dpas_kernel(const half* A, const half* B, const float* C, float* D, int num_lines, int* round_mode) {
+// 内核函数1：使用Tensor Core计算点积加（快速实现）
+__global__ void dpas_kernel_tensorcore(const half* A, const half* B, const float* C, float* D, int num_lines, int* round_mode) {
     int line_id = blockIdx.x;
     if (line_id >= num_lines) return;
 
@@ -27,11 +28,14 @@ __global__ void dpas_kernel(const half* A, const half* B, const float* C, float*
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
 
+    // 初始化累加器为C的值
     wmma::fill_fragment(acc_frag, 0.0f);
+    if (threadIdx.x == 0) {
+        acc_frag.x[0] = myC;
+    }
 
     __shared__ half smem_A[16*16];
     __shared__ half smem_B[16*16];
-    __shared__ float result_smem[16*16];
 
     // 初始化共享内存为0
     for (int i = threadIdx.x; i < 16*16; i += blockDim.x) {
@@ -53,31 +57,48 @@ __global__ void dpas_kernel(const half* A, const half* B, const float* C, float*
     wmma::load_matrix_sync(a_frag, smem_A, 16);
     wmma::load_matrix_sync(b_frag, smem_B, 16);
 
-    // 执行矩阵乘加
+    // 执行矩阵乘加 (A*B + C)
     wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
 
     // 存储结果到共享内存
+    __shared__ float result_smem[16*16];
     wmma::store_matrix_sync(result_smem, acc_frag, 16, wmma::mem_row_major);
     __syncthreads();
 
     float dot_product = result_smem[0];  // 获取点积结果
 
-    // 根据舍入模式计算最终结果
-    float final_result;
-    switch (my_round_mode) {
-        case 0:  // RND_NEAREST
-            final_result = __fadd_rn(dot_product, myC);
-            break;
-        case 1:  // RND_ZERO
-            final_result = __fadd_rz(dot_product, myC);
-            break;
-        default:
-            final_result = __fadd_rn(dot_product, myC);
-    }
-
     if (threadIdx.x == 0) {
-        D[line_id] = final_result;
+        D[line_id] = dot_product;
     }
+}
+
+// 内核函数2：使用CUDA Core计算点积加（精确实现）
+__global__ void dpas_kernel_cudacore(const half* A, const half* B, const float* C, float* D, int num_lines, int* round_mode) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_lines) return;
+
+    const half* myA = A + idx * 8;
+    const half* myB = B + idx * 8;
+    float myC = C[idx];
+    int my_round_mode = round_mode[idx];
+    
+    // 使用Kahan求和算法提高精度
+    float sum = 0.0f;
+    float c = 0.0f; // 补偿值
+    
+    for (int i = 0; i < 8; i++) {
+        float a_val = __half2float(myA[i]);
+        float b_val = __half2float(myB[i]);
+        float product = a_val * b_val;
+        
+        // Kahan求和
+        float y = product - c;
+        float t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    
+    D[idx] = sum + myC;
 }
 
 // 将十六进制字符串转换为half
@@ -111,8 +132,10 @@ std::string float2hex(float f) {
 
 int main() {
     std::map<std::string, int> roundModeMap = {
+        {"RND_NEAREST", 0},
         {"RND_ZERO", 1},
-        {"RND_NEAREST", 0}
+        {"RND_FINITE", 2},
+        {"RND_INF", 3}
     };
     
     std::string input_filename, output_filename;
@@ -144,7 +167,7 @@ int main() {
 
     std::ifstream infile(input_filename);
     if (!infile.is_open()) {
-        std::cerr << "Failed to open input file." << std::endl;
+        std::cerr << "打开输入文件失败" << std::endl;
         return 1;
     }
 
@@ -159,7 +182,6 @@ int main() {
         std::string token;
         std::vector<std::string> tokens;
         while (std::getline(iss, token, ',')) {
-            // 去除 token 前后的空格
             token.erase(0, token.find_first_not_of(" "));
             token.erase(token.find_last_not_of(" ") + 1);
             tokens.push_back(token);
@@ -174,7 +196,7 @@ int main() {
         if (roundModeMap.find(tokens[1]) != roundModeMap.end()) {
             round_mode = roundModeMap[tokens[1]];
         } else {
-            std::cerr << "Unknown rounding mode: " << tokens[1] << ", using RND_NEAREST as default." << std::endl;
+            std::cerr << "未知舍入模式：" << tokens[1] << "，使用默认舍入模式：RND_NEAREST " << std::endl;
             round_mode = 0;
         }
         round_modes.push_back(round_mode);
@@ -211,7 +233,7 @@ int main() {
 
     // 分配设备内存
     half *d_A, *d_B;
-    float *d_C, *d_D;
+    float *d_C, *d_D_tensorcore, *d_D_cudacore;
     int *d_round_mode;
 
     size_t A_size = num_lines * 8 * sizeof(half);
@@ -223,7 +245,8 @@ int main() {
     cudaMalloc(&d_A, A_size);
     cudaMalloc(&d_B, B_size);
     cudaMalloc(&d_C, C_size);
-    cudaMalloc(&d_D, D_size);
+    cudaMalloc(&d_D_tensorcore, D_size);
+    cudaMalloc(&d_D_cudacore, D_size);
     cudaMalloc(&d_round_mode, round_mode_size);
 
     // 拷贝数据到设备
@@ -232,11 +255,17 @@ int main() {
     cudaMemcpy(d_C, C_vec.data(), C_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_round_mode, round_modes.data(), round_mode_size, cudaMemcpyHostToDevice);
 
-    // 启动内核
-    dim3 blocks(num_lines);
-    dim3 threads(32);  // 一个warp
+    // 启动Tensor Core内核
+    dim3 blocks_tc(num_lines);
+    dim3 threads_tc(32);  // 一个warp
 
-    dpas_kernel<<<blocks, threads>>>(d_A, d_B, d_C, d_D, num_lines, d_round_mode);
+    dpas_kernel_tensorcore<<<blocks_tc, threads_tc>>>(d_A, d_B, d_C, d_D_tensorcore, num_lines, d_round_mode);
+
+    // 启动CUDA Core内核
+    int block_size = 256;
+    int grid_size = (num_lines + block_size - 1) / block_size;
+    
+    dpas_kernel_cudacore<<<grid_size, block_size>>>(d_A, d_B, d_C, d_D_cudacore, num_lines, d_round_mode);
 
     cudaDeviceSynchronize();
 
@@ -248,38 +277,60 @@ int main() {
     }
 
     // 拷贝结果回主机
-    std::vector<float> D_vec(num_lines);
-    cudaMemcpy(D_vec.data(), d_D, D_size, cudaMemcpyDeviceToHost);
+    std::vector<float> D_vec_tensorcore(num_lines);
+    std::vector<float> D_vec_cudacore(num_lines);
+    cudaMemcpy(D_vec_tensorcore.data(), d_D_tensorcore, D_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(D_vec_cudacore.data(), d_D_cudacore, D_size, cudaMemcpyDeviceToHost);
+
+    // 比较两种方法的精度
+    int differences = 0;
+    float max_diff = 0.0f;
+    for (int i = 0; i < num_lines; i++) {
+        float diff = fabs(D_vec_tensorcore[i] - D_vec_cudacore[i]);
+        if (diff > 1e-6) {
+            differences++;
+            if (diff > max_diff) max_diff = diff;
+            
+            // 输出差异详细信息
+            std::cout << "差异 #" << differences << ": TensorCore=" << D_vec_tensorcore[i] 
+                      << ", CUDACore=" << D_vec_cudacore[i] << ", 差异=" << diff << std::endl;
+        }
+    }
+    
+    std::cout << "精度比较结果: " << differences << " 个测试用例有显著差异，最大差异: " << max_diff << std::endl;
 
     // 释放设备内存
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
-    cudaFree(d_D);
+    cudaFree(d_D_tensorcore);
+    cudaFree(d_D_cudacore);
     cudaFree(d_round_mode);
 
     // 重新读取输入文件，并将结果追加到每行末尾
     std::ifstream infile2(input_filename);
     std::ofstream outfile(output_filename);
     if (!infile2.is_open() || !outfile.is_open()) {
-        std::cerr << "Failed to open files for writing." << std::endl;
+        std::cerr << "写入输出文件失败" << std::endl;
         return 1;
     }
 
     int index = 0;
     while (std::getline(infile2, line)) {
-        // 移除行末的换行符
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
-        // 追加结果（十六进制格式）
-        outfile << line << ", " << float2hex(D_vec[index]) << std::endl;
+        // 追加两种方法的结果（十六进制格式）
+        outfile << line << ", " << float2hex(D_vec_tensorcore[index]) 
+                << ", " << float2hex(D_vec_cudacore[index]) << std::endl;
         index++;
     }
 
     infile2.close();
     outfile.close();
 
-    std::cout << "Processing completed. Output written to " << output_filename << std::endl;
+    std::cout << "八点积加操作完成，输出文件：" << output_filename << std::endl;
+    // std::cout << "输出文件中包含两种方法的结果，倒数第二列是Tensor Core结果，倒数第一列是CUDA Core精确结果" << std::endl;
+    
     return 0;
 }
