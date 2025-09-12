@@ -1,53 +1,18 @@
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <cublasLt.h>
-#include <fstream>
 #include <iostream>
+#include <fstream>
 #include <sstream>
-#include <iomanip>
 #include <vector>
 #include <string>
-#include <cctype>
-#include <cmath>
-#include <map>
-#include <cstdint>
+#include <iomanip>
 #include <cstring>
+#include <map>
+#include <cmath>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>  // 改为BF16头文件
+#include <mma.h>
+#include <cublas_v2.h>
 
-// 操作码枚举
-enum Opcode {
-    DOT8
-};
-
-// 舍入模式枚举
-enum RoundMode {
-    RND_ZERO, RND_MINUS_INF, RND_PLUS_INF, RND_NEAREST
-};
-
-// 测试用例结构
-struct TestCase {
-    Opcode opcode;
-    RoundMode roundMode;
-    uint16_t vectorA[8]; // 使用16位存储BF16值
-    uint16_t vectorB[8]; // 使用16位存储BF16值
-    uint32_t scalarC;    // 使用32位存储FP32值
-};
-
-// 结果结构
-struct Result {
-    uint32_t result; // 使用32位存储FP32结果
-};
-
-// 字符串到操作码映射
-std::map<std::string, Opcode> opcodeMap = {
-    {"DOT8", DOT8}
-};
-
-// 字符串到舍入模式映射
-std::map<std::string, RoundMode> roundModeMap = {
-    {"RND_ZERO", RND_ZERO}, {"RND_MINUS_INF", RND_MINUS_INF},
-    {"RND_PLUS_INF", RND_PLUS_INF}, {"RND_NEAREST", RND_NEAREST}
-};
+using namespace nvcuda;
 
 // 检查CUDA错误
 #define checkCudaErrors(err)  __checkCudaErrors (err, __FILE__, __LINE__)
@@ -67,297 +32,357 @@ inline void __checkCublasErrors(cublasStatus_t err, const char *file, const int 
     }
 }
 
-// 将uint32_t转换为float
-inline float uint32ToFloat(uint32_t u) {
-    float f;
-    memcpy(&f, &u, sizeof(u));
-    return f;
+// 内核函数1：使用WMMA计算点积加（修改为BF16）
+__global__ void dpas_kernel_wmma(const __nv_bfloat16* A, const __nv_bfloat16* B, const float* C, float* D, int num_lines, int* round_mode) {
+    int line_id = blockIdx.x;
+    if (line_id >= num_lines) return;
+
+    const __nv_bfloat16* myA = A + line_id * 8;
+    const __nv_bfloat16* myB = B + line_id * 8;
+    float myC = C[line_id];
+    int my_round_mode = round_mode[line_id];
+
+    // 声明WMMA片段（修改为BF16）
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+
+    // 初始化累加器为C的值
+    wmma::fill_fragment(acc_frag, 0.0f);
+    if (threadIdx.x == 0) {
+        acc_frag.x[0] = myC;
+    }
+
+    __shared__ __nv_bfloat16 smem_A[16*16];
+    __shared__ __nv_bfloat16 smem_B[16*16];
+
+    // 初始化共享内存为0
+    for (int i = threadIdx.x; i < 16*16; i += blockDim.x) {
+        smem_A[i] = __float2bfloat16(0.0f);
+        smem_B[i] = __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+
+    // 线程0加载A和B数据到共享内存
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 8; i++) {
+            smem_A[i] = myA[i];  // 行优先，第一行前8个元素
+            smem_B[i] = myB[i];  // 列优先，第一列的前8个元素
+        }
+    }
+    __syncthreads();
+
+    // 加载矩阵到片段
+    wmma::load_matrix_sync(a_frag, smem_A, 16);
+    wmma::load_matrix_sync(b_frag, smem_B, 16);
+
+    // 执行矩阵乘加 (A*B + C)
+    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+
+    // 存储结果到共享内存
+    __shared__ float result_smem[16*16];
+    wmma::store_matrix_sync(result_smem, acc_frag, 16, wmma::mem_row_major);
+    __syncthreads();
+
+    float dot_product = result_smem[0];  // 获取点积结果
+
+    if (threadIdx.x == 0) {
+        D[line_id] = dot_product;
+    }
 }
 
-// 将float转换为uint32_t
-inline uint32_t floatToUint32(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof(f));
-    return u;
+// 内核函数2：使用CUDA Core计算点积加（精确实现，修改为BF16）
+__global__ void dpas_kernel_cudacore(const __nv_bfloat16* A, const __nv_bfloat16* B, const float* C, float* D, int num_lines, int* round_mode) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_lines) return;
+
+    const __nv_bfloat16* myA = A + idx * 8;
+    const __nv_bfloat16* myB = B + idx * 8;
+    float myC = C[idx];
+    int my_round_mode = round_mode[idx];
+    
+    // 使用Kahan求和算法提高精度
+    float sum = 0.0f;
+    float c = 0.0f; // 补偿值
+    
+    for (int i = 0; i < 8; i++) {
+        float a_val = __bfloat162float(myA[i]);
+        float b_val = __bfloat162float(myB[i]);
+        float product = a_val * b_val;
+        
+        // Kahan求和
+        float y = product - c;
+        float t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    
+    D[idx] = sum + myC;
 }
 
-// 将uint16_t转换为BF16
-inline __nv_bfloat16 uint16ToBF16(uint16_t u) {
-    __nv_bfloat16 bf;
-    memcpy(&bf, &u, sizeof(u));
-    return bf;
-}
-
-// 使用cuBLASLt执行八点积加操作
-void executeDot8WithCublasLt(const TestCase* testCases, Result* results, int numTests) {
-    cublasLtHandle_t handle;
-    checkCublasErrors(cublasLtCreate(&handle));
+// 使用cuBLAS执行八点积加操作（修改为BF16）
+void executeDot8WithCublas(const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, const float* d_C, float* d_D, int numTests) {
+    cublasHandle_t handle;
+    checkCublasErrors(cublasCreate(&handle));
     
-    // 设置矩阵描述符
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc, Ddesc;
-    cublasLtMatmulDesc_t operationDesc;
-    
-    // 创建矩阵描述符 - 使用BF16数据类型
-    checkCublasErrors(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16BF, 1, 8, 8));
-    checkCublasErrors(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16BF, 8, 1, 1));
-    checkCublasErrors(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, 1, 1, 1));
-    checkCublasErrors(cublasLtMatrixLayoutCreate(&Ddesc, CUDA_R_32F, 1, 1, 1));
-    
-    // 创建操作描述符
-    checkCublasErrors(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    
-    // 设置操作属性
-    cublasOperation_t opNoTrans = CUBLAS_OP_N;
-    checkCublasErrors(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, 
-                                                     &opNoTrans, sizeof(opNoTrans)));
-    checkCublasErrors(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, 
-                                                     &opNoTrans, sizeof(opNoTrans)));
-    
-    // 设置标量值
+    // 设置矩阵乘法参数
     float alpha = 1.0f;
     float beta = 1.0f;
     
-    // 为所有测试用例分配设备内存
-    __nv_bfloat16* d_A;
-    __nv_bfloat16* d_B;
-    float* d_C;
-    float* d_D;
-    
-    checkCudaErrors(cudaMalloc(&d_A, numTests * 8 * sizeof(__nv_bfloat16)));
-    checkCudaErrors(cudaMalloc(&d_B, numTests * 8 * sizeof(__nv_bfloat16)));
-    checkCudaErrors(cudaMalloc(&d_C, numTests * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_D, numTests * sizeof(float)));
-    
-    // 准备输入数据
-    std::vector<__nv_bfloat16> h_A(numTests * 8);
-    std::vector<__nv_bfloat16> h_B(numTests * 8);
-    std::vector<float> h_C(numTests);
-    
-    for (int i = 0; i < numTests; i++) {
-        for (int j = 0; j < 8; j++) {
-            h_A[i * 8 + j] = uint16ToBF16(testCases[i].vectorA[j]);
-            h_B[i * 8 + j] = uint16ToBF16(testCases[i].vectorB[j]);
-        }
-        h_C[i] = uint32ToFloat(testCases[i].scalarC);
-    }
-    
-    // 拷贝数据到设备
-    checkCudaErrors(cudaMemcpy(d_A, h_A.data(), numTests * 8 * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_B, h_B.data(), numTests * 8 * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_C, h_C.data(), numTests * sizeof(float), cudaMemcpyHostToDevice));
-    
     // 执行矩阵乘法 (1x8) * (8x1) + (1x1) = (1x1)
     for (int i = 0; i < numTests; i++) {
-        checkCublasErrors(cublasLtMatmul(
+        // 使用cublasGemmEx执行混合精度矩阵乘法（修改为BF16）
+        checkCublasErrors(cublasGemmEx(
             handle,
-            operationDesc,
-            &alpha,
-            d_A + i * 8, Adesc,
-            d_B + i * 8, Bdesc,
-            &beta,
-            d_C + i, Cdesc,
-            d_D + i, Ddesc,
-            nullptr,  // 使用默认算法
-            nullptr,  // 不使用工作空间
-            0,        // 工作空间大小为0
-            0         // 流ID
+            CUBLAS_OP_N,  // A矩阵不需要转置
+            CUBLAS_OP_N,  // B矩阵不需要转置
+            1,            // 结果矩阵的行数
+            1,            // 结果矩阵的列数
+            8,            // 公共维度
+            &alpha,       // alpha值
+            d_A + i * 8,  // A矩阵数据
+            CUDA_R_16BF,  // A矩阵数据类型（改为BF16）
+            1,            // A矩阵的leading dimension
+            d_B + i * 8,  // B矩阵数据
+            CUDA_R_16BF,  // B矩阵数据类型（改为BF16）
+            8,            // B矩阵的leading dimension
+            &beta,        // beta值
+            d_D + i,      // 输出矩阵数据
+            CUDA_R_32F,   // 输出矩阵数据类型
+            1,            // 输出矩阵的leading dimension
+            CUBLAS_COMPUTE_32F,  // 计算类型
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP  // 算法
         ));
     }
     
     // 同步等待所有操作完成
     checkCudaErrors(cudaDeviceSynchronize());
     
-    // 拷贝结果回主机
-    std::vector<float> h_D(numTests);
-    checkCudaErrors(cudaMemcpy(h_D.data(), d_D, numTests * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // 转换结果为uint32_t格式
-    for (int i = 0; i < numTests; i++) {
-        results[i].result = floatToUint32(h_D[i]);
-    }
-    
-    // 清理资源
-    checkCudaErrors(cudaFree(d_A));
-    checkCudaErrors(cudaFree(d_B));
-    checkCudaErrors(cudaFree(d_C));
-    checkCudaErrors(cudaFree(d_D));
-    
-    checkCublasErrors(cublasLtMatmulDescDestroy(operationDesc));
-    checkCublasErrors(cublasLtMatrixLayoutDestroy(Adesc));
-    checkCublasErrors(cublasLtMatrixLayoutDestroy(Bdesc));
-    checkCublasErrors(cublasLtMatrixLayoutDestroy(Cdesc));
-    checkCublasErrors(cublasLtMatrixLayoutDestroy(Ddesc));
-    checkCublasErrors(cublasLtDestroy(handle));
+    checkCublasErrors(cublasDestroy(handle));
 }
 
-// 解析十六进制字符串（16位）
-uint16_t parseHex16(const std::string& hexStr) {
-    return static_cast<uint16_t>(std::stoul(hexStr, nullptr, 16));
+// 将十六进制字符串转换为bfloat16
+__nv_bfloat16 hex2bfloat16(const std::string& s) {
+    unsigned short val;
+    std::stringstream ss;
+    ss << std::hex << s;
+    ss >> val;
+    return __ushort_as_bfloat16(val);
 }
 
-// 解析十六进制字符串（32位）
-uint32_t parseHex32(const std::string& hexStr) {
-    return static_cast<uint32_t>(std::stoul(hexStr, nullptr, 16));
+// 将十六进制字符串转换为float
+float hex2float(const std::string& s) {
+    unsigned int val;
+    std::stringstream ss;
+    ss << std::hex << s;
+    ss >> val;
+    float result;
+    std::memcpy(&result, &val, sizeof(val));
+    return result;
 }
 
-// 读取输入文件
-std::vector<TestCase> readInputFile(const std::string& filename) {
-    std::vector<TestCase> testCases;
-    std::ifstream file(filename);
-    
-    if (!file.is_open()) {
-        std::cerr << "错误：无法打开输入文件 " << filename << std::endl;
-        return testCases;
-    }
-    
-    std::string line;
-    int lineNum = 0;
-    while (std::getline(file, line)) {
-        lineNum++;
-        
-        std::istringstream iss(line);
-        std::string token;
-        std::vector<std::string> tokens;
-        
-        while (std::getline(iss, token, ',')) {
-            token.erase(0, token.find_first_not_of(' '));
-            token.erase(token.find_last_not_of(' ') + 1);
-            tokens.push_back(token);
-        }
-        
-        if (tokens.size() == 19) {
-            TestCase tc;
-            if (opcodeMap.find(tokens[0]) != opcodeMap.end()) {
-                tc.opcode = opcodeMap[tokens[0]];
-            } else {
-                std::cerr << "未知操作码: " << tokens[0] << std::endl;
-                continue;
-            }
-            
-            if (roundModeMap.find(tokens[1]) != roundModeMap.end()) {
-                tc.roundMode = roundModeMap[tokens[1]];
-            } else {
-                std::cerr << "未知舍入模式: " << tokens[1] << std::endl;
-                continue;
-            }
-            
-            for (int i = 0; i < 8; i++) {
-                tc.vectorA[i] = parseHex16(tokens[2 + i]);
-            }
-            
-            for (int i = 0; i < 8; i++) {
-                tc.vectorB[i] = parseHex16(tokens[10 + i]);
-            }
-            
-            tc.scalarC = parseHex32(tokens[18]);
-            
-            testCases.push_back(tc);
-        } else {
-            std::cerr << "行 " << lineNum << " 字段数量不正确，应为19，实际为" << tokens.size() << std::endl;
-        }
-    }
-    
-    if (testCases.empty()) {
-        std::cerr << "警告：输入文件中没有找到有效测试用例\n";
-    }
-    
-    return testCases;
-}
-
-// 写输出文件
-void writeOutputFile(const std::string& filename, 
-                    const std::vector<TestCase>& testCases,
-                    const std::vector<Result>& results) {
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "错误：无法创建输出文件 " << filename << std::endl;
-        return;
-    }
-    
-    file << "Opcode, Rnd, A0, A1, A2, A3, A4, A5, A6, A7, B0, B1, B2, B3, B4, B5, B6, B7, C, Result\n";
-    
-    // 反向映射用于输出
-    std::map<Opcode, std::string> opcodeStr;
-    for (const auto& p : opcodeMap) opcodeStr[p.second] = p.first;
-    
-    std::map<RoundMode, std::string> roundModeStr;
-    for (const auto& p : roundModeMap) roundModeStr[p.second] = p.first;
-    
-    for (size_t i = 0; i < testCases.size(); ++i) {
-        const TestCase& tc = testCases[i];
-        const Result& res = results[i];
-        
-        file << opcodeStr[tc.opcode] << ", "
-             << roundModeStr[tc.roundMode] << ", ";
-        
-        // 输出向量A (16位，4位十六进制)
-        for (int j = 0; j < 8; j++) {
-            file << "0x" << std::hex << std::setw(4) << std::setfill('0') << tc.vectorA[j];
-            if (j < 7) file << ", ";
-        }
-        
-        file << ", ";
-        
-        // 输出向量B (16位，4位十六进制)
-        for (int j = 0; j < 8; j++) {
-            file << "0x" << std::hex << std::setw(4) << std::setfill('0') << tc.vectorB[j];
-            if (j < 7) file << ", ";
-        }
-        
-        // 输出标量C (32位，8位十六进制)和结果 (32位，8位十六进制)
-        file << ", 0x" << std::hex << std::setw(8) << std::setfill('0') << tc.scalarC
-             << ", 0x" << std::hex << std::setw(8) << std::setfill('0') << res.result << "\n";
-    }
+// 将float转换为十六进制字符串
+std::string float2hex(float f) {
+    unsigned int u;
+    std::memcpy(&u, &f, sizeof(f));
+    std::stringstream ss;
+    ss << "0x" << std::hex << std::setw(8) << std::setfill('0') << u;
+    return ss.str();
 }
 
 int main() {
-    std::string inputFilename, outputFilename;
+    std::map<std::string, int> roundModeMap = {
+        {"RND_NEAREST", 0},
+        {"RND_ZERO", 1},
+        {"RND_FINITE", 2},
+        {"RND_INF", 3}
+    };
+    
+    std::string input_filename, output_filename;
     
     // 获取输入文件名
     while (true) {
-        std::cout << "请输入输入文件名 (默认: bf16_dot8_input.txt): ";
-        std::getline(std::cin, inputFilename);
+        std::cout << "请输入输入文件名 (默认: bf16_pda_input.txt): ";
+        std::getline(std::cin, input_filename);
         
-        if (inputFilename.empty()) {
-            inputFilename = "bf16_dot8_input.txt";
+        if (input_filename.empty()) {
+            input_filename = "bf16_pda_input.txt";  // 修改默认文件名
         }
         
-        std::ifstream testFile(inputFilename);
+        std::ifstream testFile(input_filename);
         if (testFile.good()) {
             testFile.close();
             break;
         }
         
-        std::cout << "文件 " << inputFilename << " 不存在，请重新输入。\n";
+        std::cout << "文件 " << input_filename << " 不存在，请重新输入。\n";
     }
     
     // 获取输出文件名
-    std::cout << "请输入输出文件名 (默认: bf16_dot8_output.txt): ";
-    std::getline(std::cin, outputFilename);
-    if (outputFilename.empty()) {
-        outputFilename = "bf16_dot8_output.txt";
+    std::cout << "请输入输出文件名 (默认: bf16_pda_output.txt): ";
+    std::getline(std::cin, output_filename);
+    if (output_filename.empty()) {
+        output_filename = "bf16_pda_output.txt";  // 修改默认文件名
     }
-    
-    // 读取输入文件
-    std::vector<TestCase> testCases = readInputFile(inputFilename);
-    if (testCases.empty()) {
+
+    std::ifstream infile(input_filename);
+    if (!infile.is_open()) {
+        std::cerr << "打开输入文件失败" << std::endl;
+        return 1;
+    }
+
+    std::vector<int> round_modes;
+    std::vector<__nv_bfloat16> A_vec;  // 改为BF16
+    std::vector<__nv_bfloat16> B_vec;  // 改为BF16
+    std::vector<float> C_vec;
+    std::string line;
+
+    while (std::getline(infile, line)) {
+        std::istringstream iss(line);
+        std::string token;
+        std::vector<std::string> tokens;
+        while (std::getline(iss, token, ',')) {
+            token.erase(0, token.find_first_not_of(" "));
+            token.erase(token.find_last_not_of(" ") + 1);
+            tokens.push_back(token);
+        }
+        if (tokens.size() < 19) {
+            std::cerr << "Invalid line: " << line << std::endl;
+            continue;
+        }
+
+        // 解析舍入模式
+        int round_mode;
+        if (roundModeMap.find(tokens[1]) != roundModeMap.end()) {
+            round_mode = roundModeMap[tokens[1]];
+        } else {
+            std::cerr << "未知舍入模式：" << tokens[1] << "，使用默认舍入模式：RND_NEAREST " << std::endl;
+            round_mode = 0;
+        }
+        round_modes.push_back(round_mode);
+
+        // 解析A的8个元素（改为BF16）
+        for (int i = 0; i < 8; i++) {
+            std::string hex_str = tokens[2 + i];
+            __nv_bfloat16 h = hex2bfloat16(hex_str);
+            A_vec.push_back(h);
+        }
+
+        // 解析B的8个元素（改为BF16）
+        for (int i = 0; i < 8; i++) {
+            std::string hex_str = tokens[10 + i];
+            __nv_bfloat16 h = hex2bfloat16(hex_str);
+            B_vec.push_back(h);
+        }
+
+        // 解析C
+        std::string hex_c = tokens[18];
+        float c_val = hex2float(hex_c);
+        C_vec.push_back(c_val);
+    }
+
+    infile.close();
+    int num_lines = round_modes.size();
+
+    if (num_lines == 0) {
         std::cerr << "错误：无有效测试用例，程序终止。\n";
         return 1;
     }
+
+    std::cout << "找到 " << num_lines << " 个测试用例，开始处理...\n";
+
+    // 分配设备内存（改为BF16）
+    __nv_bfloat16 *d_A, *d_B;
+    float *d_C, *d_D_wmma, *d_D_cudacore, *d_D_cublas;
+    int *d_round_mode;
+
+    size_t A_size = num_lines * 8 * sizeof(__nv_bfloat16);
+    size_t B_size = num_lines * 8 * sizeof(__nv_bfloat16);
+    size_t C_size = num_lines * sizeof(float);
+    size_t D_size = num_lines * sizeof(float);
+    size_t round_mode_size = num_lines * sizeof(int);
+
+    cudaMalloc(&d_A, A_size);
+    cudaMalloc(&d_B, B_size);
+    cudaMalloc(&d_C, C_size);
+    cudaMalloc(&d_D_wmma, D_size);
+    cudaMalloc(&d_D_cudacore, D_size);
+    cudaMalloc(&d_D_cublas, D_size);
+    cudaMalloc(&d_round_mode, round_mode_size);
+
+    // 拷贝数据到设备
+    cudaMemcpy(d_A, A_vec.data(), A_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B_vec.data(), B_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_C, C_vec.data(), C_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_round_mode, round_modes.data(), round_mode_size, cudaMemcpyHostToDevice);
+
+    // 启动WMMA内核
+    dim3 blocks_wmma(num_lines);
+    dim3 threads_wmma(32);  // 一个warp
+
+    dpas_kernel_wmma<<<blocks_wmma, threads_wmma>>>(d_A, d_B, d_C, d_D_wmma, num_lines, d_round_mode);
+
+    // 启动CUDA Core内核
+    int block_size = 256;
+    int grid_size = (num_lines + block_size - 1) / block_size;
     
-    int numTests = testCases.size();
-    std::cout << "找到 " << numTests << " 个测试用例，开始处理...\n";
+    dpas_kernel_cudacore<<<grid_size, block_size>>>(d_A, d_B, d_C, d_D_cudacore, num_lines, d_round_mode);
+
+    // 使用cuBLAS计算
+    executeDot8WithCublas(d_A, d_B, d_C, d_D_cublas, num_lines);
+
+    cudaDeviceSynchronize();
+
+    // 检查内核执行错误
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "Kernel execution failed: " << cudaGetErrorString(err) << std::endl;
+        return 1;
+    }
+
+    // 拷贝结果回主机
+    std::vector<float> D_vec_wmma(num_lines);
+    std::vector<float> D_vec_cudacore(num_lines);
+    std::vector<float> D_vec_cublas(num_lines);
+    cudaMemcpy(D_vec_wmma.data(), d_D_wmma, D_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(D_vec_cudacore.data(), d_D_cudacore, D_size, cudaMemcpyDeviceToHost);
+    cudaMemcpy(D_vec_cublas.data(), d_D_cublas, D_size, cudaMemcpyDeviceToHost);
+
+
+    // 释放设备内存
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    cudaFree(d_D_wmma);
+    cudaFree(d_D_cudacore);
+    cudaFree(d_D_cublas);
+    cudaFree(d_round_mode);
+
+    // 重新读取输入文件，并将结果追加到每行末尾
+    std::ifstream infile2(input_filename);
+    std::ofstream outfile(output_filename);
+    if (!infile2.is_open() || !outfile.is_open()) {
+        std::cerr << "写入输出文件失败" << std::endl;
+        return 1;
+    }
+
+    int index = 0;
+    while (std::getline(infile2, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        // 追加三种方法的结果（十六进制格式）
+        outfile << line << ", " << float2hex(D_vec_wmma[index]) 
+                << ", " << float2hex(D_vec_cudacore[index])
+                << ", " << float2hex(D_vec_cublas[index]) << std::endl;
+        index++;
+    }
+
+    infile2.close();
+    outfile.close();
+
+    std::cout << "八点积加操作完成，输出文件：" << output_filename << std::endl;
+    std::cout << "输出文件中包含三种方法的结果，倒数第三列是WMMA结果，倒数第二列是CUDA Core结果，最后一列是cuBLAS结果" << std::endl;
     
-    // 分配结果内存
-    std::vector<Result> results(numTests);
-    
-    // 使用cuBLASLt执行测试
-    executeDot8WithCublasLt(testCases.data(), results.data(), numTests);
-    
-    // 写输出文件
-    writeOutputFile(outputFilename, testCases, results);
-    
-    std::cout << "H100 BF16(A,B) FP32(C) 八点积加测试完成，结果已写入 " << outputFilename << std::endl;
-    // std::cout << "nvcc -arch=sm_90 -o BF16H100DPA_CUBLASLT BF16H100DPA.cu -lcublasLt" << std::endl;
     return 0;
 }

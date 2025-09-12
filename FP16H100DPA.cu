@@ -348,30 +348,6 @@ int main() {
     cudaMemcpy(D_vec_cudacore.data(), d_D_cudacore, D_size, cudaMemcpyDeviceToHost);
     cudaMemcpy(D_vec_cublas.data(), d_D_cublas, D_size, cudaMemcpyDeviceToHost);
 
-    // 比较WMMA和cuBLAS分别与CUDA Core的精度
-    int differences_wmma_cc = 0;
-    int differences_cublas_cc = 0;
-    float max_diff_wmma_cc = 0.0f;
-    float max_diff_cublas_cc = 0.0f;
-    
-    for (int i = 0; i < num_lines; i++) {
-        float diff_wmma_cc = fabs(D_vec_wmma[i] - D_vec_cudacore[i]);
-        float diff_cublas_cc = fabs(D_vec_cublas[i] - D_vec_cudacore[i]);
-        
-        if (diff_wmma_cc > 1e-6) {
-            differences_wmma_cc++;
-            if (diff_wmma_cc > max_diff_wmma_cc) max_diff_wmma_cc = diff_wmma_cc;
-        }
-        
-        if (diff_cublas_cc > 1e-6) {
-            differences_cublas_cc++;
-            if (diff_cublas_cc > max_diff_cublas_cc) max_diff_cublas_cc = diff_cublas_cc;
-        }
-    }
-    
-    std::cout << "精度比较结果:" << std::endl;
-    std::cout << "WMMA vs CUDA Core: " << differences_wmma_cc << " 个测试用例有显著差异，最大差异: " << max_diff_wmma_cc << std::endl;
-    std::cout << "cuBLAS vs CUDA Core: " << differences_cublas_cc << " 个测试用例有显著差异，最大差异: " << max_diff_cublas_cc << std::endl;
 
     // 释放设备内存
     cudaFree(d_A);
