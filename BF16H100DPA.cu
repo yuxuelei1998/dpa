@@ -102,22 +102,22 @@ __global__ void dpas_kernel_cudacore(const __nv_bfloat16* A, const __nv_bfloat16
     int my_round_mode = round_mode[idx];
     
     // 使用Kahan求和算法提高精度
-    float sum = 0.0f;
-    float c = 0.0f; // 补偿值
+    double sum = 0.0;
+    double c = 0.0; // 补偿值
     
     for (int i = 0; i < 8; i++) {
-        float a_val = __bfloat162float(myA[i]);
-        float b_val = __bfloat162float(myB[i]);
-        float product = a_val * b_val;
+        double a_val = __bfloat162float(myA[i]);
+        double b_val = __bfloat162float(myB[i]);
+        double product = a_val * b_val;
         
         // Kahan求和
-        float y = product - c;
-        float t = sum + y;
+        double y = product - c;
+        double t = sum + y;
         c = (t - sum) - y;
         sum = t;
     }
     
-    D[idx] = sum + myC;
+    D[idx] = (float)(sum + (double)myC);
 }
 
 // 使用cuBLAS执行八点积加操作（修改为BF16）
